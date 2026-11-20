@@ -242,14 +242,78 @@ async function gemini(body, timeoutMs = 20000, hedgeMs = 12000) {
     launch();
   });
 }
+// Streaming version for the live conversation: text arrives piece by piece (Server-Sent Events).
+// If nothing has arrived after `firstMs` the model is treated as busy and the next one is tried.
+async function geminiStreamOnce(model, body, onText, firstMs) {
+  const ctl = new AbortController();
+  let timer = setTimeout(() => ctl.abort(), firstMs);
+  let acc = "";
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, {
+      method: "POST", signal: ctl.signal,
+      headers: { "x-goog-api-key": S.gemKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let detail = ""; try { const j = await r.json(); detail = (Array.isArray(j) ? j[0] : j).error?.message || ""; } catch {}
+      throw new GeminiError(r.status, detail);
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;
+        let j; try { j = JSON.parse(line.slice(5)); } catch { continue; }
+        if (j.error) throw new GeminiError(j.error.code || 500, j.error.message);
+        const t = (j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("");
+        if (t) {
+          if (!acc) { clearTimeout(timer); timer = setTimeout(() => ctl.abort(), 30000); } // got going: allow time to finish
+          acc += t; onText?.(acc);
+        }
+      }
+    }
+    if (!acc) throw new GeminiError("blocked", "empty");
+    return acc;
+  } catch (e) {
+    if (acc) return acc; // cut off mid-reply: keep what arrived (it is already on screen and being spoken)
+    if (e.name === "AbortError") throw new GeminiError("timeout", "timeout");
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+// Tries models one after another (the saved one first) with the same rules as gemini().
+async function geminiChat(body, onText) {
+  const models = (await gemCandidates()).slice(0, 4);
+  let last = null;
+  for (const [i, m] of models.entries()) {
+    try {
+      // free-tier answers come back either in ~1 s or after a long queue — don't sit in the queue, try another model;
+      // the last one gets more time so a slow answer still beats no answer
+      const t = await geminiStreamOnce(m, body, onText, i < models.length - 1 ? 4500 : 20000);
+      if (S.gemModel !== m) { S.gemModel = m; saveS(); }
+      return t;
+    } catch (e) {
+      if (!(e instanceof GeminiError)) throw e;
+      last = e;
+      const closed = e.status === 404 || (e.status === 429 && /limit: 0|free_tier/i.test(e.message));
+      if (closed) { S.gemBad = [...new Set([...(S.gemBad || []), m])]; saveS(); continue; }
+      if (e.status === 503 || e.status === 429 || e.status === 500 || e.status === "timeout") continue;
+      throw e;
+    }
+  }
+  throw last || new GeminiError(404, "no models");
+}
 const toGem = (msgs) => msgs.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
 
 /* ---- one interface for both AIs ---- */
 async function aiChat(system, messages, onText) {
   if (usingGemini()) {
-    const t = await gemini({ systemInstruction: { parts: [{ text: system }] }, contents: toGem(messages),
-      generationConfig: { temperature: 0.9, maxOutputTokens: 2048 } });
-    onText?.(t); return t;
+    return geminiChat({ systemInstruction: { parts: [{ text: system }] }, contents: toGem(messages),
+      generationConfig: { temperature: 0.9, maxOutputTokens: 2048 } }, onText);
   }
   const stream = client().beta.messages.stream({ model: S.model, max_tokens: 1024, system, messages, output_config: { effort: "low" }, ...fallbackOpts() });
   let acc = "";
@@ -334,7 +398,7 @@ $("startCall").onclick = async () => {
   if (!haveKey()) { fillSettings(); show("settings"); alert(usingGemini() ? "먼저 Gemini API 키를 넣어 주세요." : "먼저 Claude API 키를 넣어 주세요."); return; }
   show("call");
   history = [{ role: "user", content: "(통화가 연결됐어. 네가 먼저 상황에 맞게 짧게 인사해.)" }];
-  tips = []; heard = ""; elPrev = ""; $("mine").textContent = ""; $("caption").textContent = "";
+  tips = []; heard = ""; elPrev = ""; reopenCount = 0; elWarned = false; $("mine").textContent = ""; $("caption").textContent = "";
   inCall = true; startTime = Date.now(); clearInterval(timerId); timerId = setInterval(tick, 1000); tick();
   setState();
   startCamera();
@@ -351,18 +415,35 @@ async function startCamera() {
 function stopCamera() { camStream?.getTracks().forEach((t) => t.stop()); camStream = null; }
 $("camBtn").onclick = () => { if (camStream) { stopCamera(); $("selfCam").hidden = true; } else startCamera(); };
 
+// Haru's reply streams in; each finished sentence is handed to the voice right away,
+// so Haru starts talking before the whole reply (and the coach tip) has arrived.
 async function haruTurn() {
   busy = true; thinking = true; setState();
+  sayReset();
+  let queued = 0; // characters of the reply already handed to the voice
+  const feed = (acc, final) => {
+    const body = acc.split("#")[0]; // stop at the "###팁" marker, even half-streamed
+    $("caption").textContent = body.trim() || "…";
+    if (thinking && body.trim()) { thinking = false; setState(); }
+    let upto = queued;
+    const re = /[.!?…]+["'”’)]*\s+|\n+/g; let m;
+    while ((m = re.exec(body))) { const end = m.index + m[0].length; if (end > queued && end - queued >= 6) upto = end; }
+    if (final) upto = body.length;
+    if (upto > queued) { const chunk = body.slice(queued, upto).trim(); queued = upto; if (chunk) sayPush(chunk); }
+  };
   let reply = "", tip = "";
   try {
-    const text = await aiChat(systemPrompt(), history, (acc) => { $("caption").textContent = acc.split("###팁")[0].trim() || "…"; });
+    const text = await aiChat(systemPrompt(), history, (acc) => feed(acc, false));
+    feed(text, true);
     const i = text.indexOf("###팁");
-    reply = (i < 0 ? text : text.slice(0, i)).trim();
+    reply = (i < 0 ? text : text.slice(0, i)).replace(/#+\s*$/, "").trim();
     tip = i < 0 ? "" : text.slice(i + 4).trim().split("\n")[0].trim();
   } catch (e) {
     thinking = false; busy = false; setState();
+    sayReset();
     $("caption").textContent = errText(e);
     if (history.at(-1)?.role === "user" && history.length > 1) history.pop();
+    listenSoon();
     return;
   }
   thinking = false;
@@ -370,8 +451,8 @@ async function haruTurn() {
   if (tip) { tips.push(tip); flashTip(tip); }
   $("caption").textContent = reply;
   busy = false; setState();
-  await speak(reply);
-  if (inCall && !busy) listen(); // hands-free: listen as soon as Haru stops talking
+  await sayDone();
+  listenSoon(); // hands-free: listen as soon as Haru stops talking
 }
 
 let tipTimer = 0;
@@ -396,37 +477,34 @@ async function voiceSettings() {
 }
 // Spoken-text cleanup: ElevenLabs reads "…" and "~" oddly in Korean.
 const tidy = (t) => t.replace(/…+|\.{3,}/g, ", ").replace(/~+/g, "").replace(/\s+,/g, ",").replace(/,\s*,/g, ",").trim();
-async function speakEleven(text) {
+// Fetches the audio for one piece of text (called as soon as the sentence exists, so the next
+// sentence downloads while the current one plays).
+async function elevenFetch(text) {
   const body = { text: tidy(text), model_id: S.elModel };
   const vs = await voiceSettings(); if (vs) body.voice_settings = vs;
-  if (S.elModel !== "eleven_v3" && elPrev) body.previous_text = elPrev; // keeps intonation consistent between turns
+  if (S.elModel !== "eleven_v3" && elPrev) body.previous_text = elPrev; // keeps intonation consistent between sentences
+  elPrev = body.text;
   const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(S.elVoice)}?output_format=mp3_44100_128`, {
     method: "POST",
     headers: { "xi-api-key": S.elKey, "Content-Type": "application/json", Accept: "audio/mpeg" },
     body: JSON.stringify(body),
   });
-  elPrev = body.text;
   if (!r.ok) {
     const msg = r.status === 401 ? "ElevenLabs 키가 맞지 않아요" : r.status === 402 || r.status === 429 ? "ElevenLabs 크레딧/사용량이 부족해요" : `ElevenLabs 오류 ${r.status}`;
     throw new Error(msg);
   }
-  const url = URL.createObjectURL(await r.blob());
+  return r.blob();
+}
+async function playBlob(blob) {
+  const url = URL.createObjectURL(blob);
   try {
     elAudio = new Audio(url);
     await new Promise((res, rej) => { elAudio.onended = res; elAudio.onerror = rej; elAudio.play().catch(rej); });
   } finally { URL.revokeObjectURL(url); elAudio = null; }
 }
-function stopSpeaking() { TextToSpeech.stop().catch(() => {}); if (elAudio) { elAudio.pause(); elAudio.onended?.(); } }
-
-async function speak(text) {
-  speaking = true; setState();
-  if (S.engine === "eleven" && S.elKey && S.elVoice) {
-    try { await speakEleven(text); speaking = false; setState(); if (!$("settings").hidden) $("elMsg").textContent = "✓ ElevenLabs 목소리로 재생했어요."; return; }
-    catch (e) {
-      const m = (e.message || "ElevenLabs 연결 실패") + " · 휴대폰 목소리로 대신 말했어요";
-      flashTip(m); if (!$("settings").hidden) $("elMsg").textContent = "⚠ " + m;
-    }
-  }
+const voiceOut = { phone: null }; // test hook: replaced by a fake voice when testing on a PC
+async function phoneSay(text) {
+  if (voiceOut.phone) return voiceOut.phone(text);
   try {
     const opt = { text, lang: "ko-KR", rate: S.rate, pitch: S.pitch, volume: 1, category: "playback" };
     if (S.voice >= 0) opt.voice = S.voice;
@@ -434,39 +512,134 @@ async function speak(text) {
   } catch {
     await new Promise((r) => setTimeout(r, Math.min(8000, text.length * 110)));
   }
-  speaking = false; setState();
 }
+function stopSpeaking() { TextToSpeech.stop().catch(() => {}); if (elAudio) { elAudio.pause(); elAudio.onended?.(); } }
+
+/* A queue of things for Haru to say, played in order. sayReset() cuts it off (new turn, user interrupts). */
+const useEleven = () => S.engine === "eleven" && S.elKey && S.elVoice;
+let sayQ = [], sayRunning = null, sayGen = 0, elWarned = false;
+function sayReset() { sayGen++; sayQ = []; stopSpeaking(); speaking = false; setState(); }
+function sayPush(text) {
+  const item = { text, audio: useEleven() ? elevenFetch(text) : null };
+  item.audio?.catch(() => {}); // handled when played
+  sayQ.push(item);
+  if (!sayRunning || sayRunning.gen !== sayGen) sayRunning = { gen: sayGen, p: sayLoop(sayGen) };
+}
+async function sayLoop(gen) {
+  speaking = true; setState();
+  while (sayQ.length && gen === sayGen) {
+    const it = sayQ.shift();
+    if (it.audio) {
+      try {
+        await playBlob(await it.audio);
+        if (!$("settings").hidden) $("elMsg").textContent = "✓ ElevenLabs 목소리로 재생했어요.";
+        continue;
+      } catch (e) {
+        if (gen !== sayGen) break;
+        const m = (e.message || "ElevenLabs 연결 실패") + " · 휴대폰 목소리로 대신 말했어요";
+        if (!elWarned) { flashTip(m); elWarned = true; }
+        if (!$("settings").hidden) $("elMsg").textContent = "⚠ " + m;
+      }
+    }
+    if (gen === sayGen) await phoneSay(it.text);
+  }
+  if (gen === sayGen) { speaking = false; setState(); }
+  if (sayRunning?.gen === gen) sayRunning = null;
+}
+async function sayDone() { while (sayRunning && sayRunning.gen === sayGen) await sayRunning.p; }
+async function speak(text) { sayReset(); elWarned = false; sayPush(text); await sayDone(); }
 
 /* ---- speech in ---- */
-SpeechRecognition.addListener("partialResults", (d) => {
-  heard = d.matches?.[0] || heard;
-  $("mine").textContent = heard;
-});
-SpeechRecognition.addListener("listeningState", (d) => {
-  if (d.status === "started") { listening = true; setState(); return; }
-  listening = false; setState();
-  const t = heard.trim(); heard = "";
-  if (t && inCall && !busy) userSays(t);
-});
-async function listen() {
-  if (!inCall || listening) return;
-  heard = ""; $("mine").textContent = "듣고 있어요… 말해 보세요";
-  try {
-    stopSpeaking();
-    await SpeechRecognition.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 });
-  } catch {
-    listening = false; setState(); $("mine").textContent = "마이크를 쓸 수 없어요. 아래에 글로 입력해 주세요.";
+// How the Android recognizer behaves (from the plugin's source):
+// - "started" only fires when the person begins to speak, not when the mic opens.
+// - "stopped" fires at end of speech, *before* the final words arrive.
+// - If nobody speaks for a few seconds (or it hears nothing it can match) it shuts down with an error
+//   that never reaches the page — so the page must notice on its own and reopen the mic.
+// - In dictation mode (live text on) it waits a long time after the person stops talking.
+// So the page keeps its own state: it decides the turn is over after a short silence in the live text,
+// and reopens the mic if nothing at all has arrived for a while.
+const mic = {
+  start: (o) => SpeechRecognition.start(o),
+  stop: () => SpeechRecognition.stop(),
+};
+const SILENCE_MS = 1300;  // no new words for this long → the person has finished
+const NO_SPEECH_MS = 8000; // nothing heard at all → the recognizer has probably shut down; reopen it
+const MAX_REOPEN = 6;      // quiet reopenings (~50 s of silence) before waiting for a tap
+let micSession = 0, silenceT = 0, watchdogT = 0, reopenCount = 0, listenSoonT = 0;
+
+function onPartial(d) {
+  if (!listening) return;
+  const t = d.matches?.[0];
+  if (!t || t === heard) return;
+  heard = t; $("mine").textContent = heard;
+  clearTimeout(watchdogT);
+  clearTimeout(silenceT); silenceT = setTimeout(endTurn, speechEnded ? 300 : SILENCE_MS);
+}
+let speechEnded = false;
+function onListeningState(d) {
+  if (!listening) return;
+  if (d.status === "started") speechEnded = false;
+  if (d.status === "stopped") {
+    speechEnded = true;
+    // end of speech: the final words may still be on their way — give them a moment
+    clearTimeout(silenceT); silenceT = setTimeout(endTurn, heard.trim() ? 500 : 300);
   }
 }
-$("micBtn").onclick = () => { if (listening) SpeechRecognition.stop().catch(() => {}); else listen(); };
+SpeechRecognition.addListener("partialResults", (d) => onPartial(d));
+SpeechRecognition.addListener("listeningState", (d) => onListeningState(d));
+
+function stopMic() {
+  if (!listening) return;
+  listening = false; micSession++;
+  clearTimeout(silenceT); clearTimeout(watchdogT);
+  mic.stop().catch(() => {});
+  setState();
+}
+function endTurn() {
+  if (!listening) return;
+  const t = heard.trim(); heard = "";
+  stopMic();
+  if (t && inCall && !busy) { reopenCount = 0; userSays(t); }
+  else reopen();
+}
+function reopen() {
+  if (!inCall || busy || speaking) return;
+  if (reopenCount++ < MAX_REOPEN) listenSoon(250);
+  else $("mine").textContent = "🎤 버튼을 누르고 말해 주세요";
+}
+function listenSoon(ms = 250) { clearTimeout(listenSoonT); listenSoonT = setTimeout(() => listen(), ms); }
+
+async function listen(fromTap = false) {
+  if (!inCall || listening || busy) return;
+  if (fromTap) reopenCount = 0;
+  sayReset(); // never listen while Haru is talking (the mic would hear her)
+  listening = true; heard = ""; speechEnded = false; const my = ++micSession;
+  $("mine").textContent = "듣고 있어요… 말해 보세요";
+  setState();
+  clearTimeout(watchdogT);
+  watchdogT = setTimeout(() => { if (listening && micSession === my && !heard) { stopMic(); reopen(); } }, NO_SPEECH_MS);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await mic.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 });
+      return;
+    } catch (e) {
+      if (micSession !== my) return; // stopped meanwhile
+      if (attempt === 0) { await mic.stop().catch(() => {}); await new Promise((r) => setTimeout(r, 600)); continue; } // recognizer still busy from last time
+      listening = false; clearTimeout(watchdogT); setState();
+      $("mine").textContent = "마이크를 쓸 수 없어요. 아래에 글로 입력해 주세요.";
+    }
+  }
+}
+$("micBtn").onclick = () => { if (listening) endTurn(); else listen(true); };
 $("typeForm").onsubmit = (e) => {
   e.preventDefault();
   const t = $("typeInput").value.trim(); if (!t || busy || !inCall) return;
-  $("typeInput").value = ""; $("mine").textContent = t;
-  if (listening) { heard = ""; SpeechRecognition.stop().catch(() => {}); }
+  $("typeInput").value = ""; heard = "";
+  stopMic();
   userSays(t);
 };
-function userSays(t) { $("mine").textContent = t; history.push({ role: "user", content: t }); haruTurn(); }
+function userSays(t) { clearTimeout(listenSoonT); $("mine").textContent = t; history.push({ role: "user", content: t }); haruTurn(); }
+if (import.meta.env.DEV) window.__haru = { mic, voiceOut, onPartial, onListeningState, state: () => ({ listening, speaking, busy, thinking, heard, reopenCount }) };
 
 $("hintBtn").onclick = async () => {
   if (busy) return;
@@ -501,8 +674,8 @@ const REPORT_SCHEMA = {
 };
 
 $("endBtn").onclick = async () => {
-  inCall = false; clearInterval(timerId);
-  SpeechRecognition.stop().catch(() => {}); stopSpeaking();
+  inCall = false; clearInterval(timerId); clearTimeout(listenSoonT);
+  stopMic(); sayReset();
   stopCamera(); listening = speaking = false;
   const userTurns = history.filter((m, i) => i > 0 && m.role === "user").length;
   show("reportScreen");
