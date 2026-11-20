@@ -77,13 +77,23 @@ async function listGemModels(key) {
   const ok = models
     .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && /gemini/.test(m.name) && !/embedding|image|tts|audio|live|vision|aqa|robotics|computer-use/.test(m.name))
     .map((m) => m.name.replace(/^models\//, ""));
-  const rank = (n) => (/flash/.test(n) ? 0 : 4) + (/lite/.test(n) ? 1 : 0) + (/preview|exp/.test(n) ? 2 : 0);
-  return ok.sort((a, b) => rank(a) - rank(b) || b.localeCompare(a, undefined, { numeric: true }));
+  // Newer versions first ("-latest" aliases count as newest): older ones like 2.5 are often closed to new keys.
+  // Flash beats lite beats preview; pro and other families last (small or no free tier).
+  const rank = (n) => {
+    const v = /-latest$/.test(n) ? 99 : parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
+    return -v * 10 + (/lite/.test(n) ? 3 : 0) + (/preview|exp/.test(n) ? 4 : 0) + (/flash/.test(n) ? 0 : 1000);
+  };
+  return ok.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
 }
-async function resolveGemModel() {
-  const list = await listGemModels(S.gemKey);
-  if (!list.length) throw new GeminiError(404, "no models");
-  if (!list.includes(S.gemModel)) { S.gemModel = list[0]; saveS(); }
+// Picks the next model that hasn't failed for this key. Models listed by the API can still answer 404
+// ("no longer available to new users"), so failed ones are remembered and skipped.
+async function resolveGemModel(failed) {
+  S.gemBad = S.gemBad || [];
+  if (failed && !S.gemBad.includes(failed)) S.gemBad.push(failed);
+  const list = (await listGemModels(S.gemKey)).filter((m) => !S.gemBad.includes(m));
+  if (!list.length) { S.gemBad = []; saveS(); throw new GeminiError(404, "no models"); }
+  if (!list.includes(S.gemModel)) S.gemModel = list[0];
+  saveS();
   return S.gemModel;
 }
 $("gemLoad").onclick = async () => {
@@ -93,8 +103,9 @@ $("gemLoad").onclick = async () => {
   try {
     const ok = await listGemModels(key);
     const sel = $("gemModel"), keep = sel.value; sel.textContent = "";
-    ok.forEach((n, i) => sel.add(new Option(n + (i === 0 ? " (추천)" : ""), n)));
-    sel.value = ok.includes(keep) ? keep : ok[0];
+    const usable = ok.filter((m) => !(S.gemBad || []).includes(m));
+    usable.forEach((n, i) => sel.add(new Option(n + (i === 0 ? " (추천)" : ""), n)));
+    sel.value = usable.includes(keep) ? keep : usable[0];
     $("gemMsg").textContent = `${ok.length}개 모델을 불러왔어요. 이름에 flash가 들어간 모델이 빠르고 무료 사용량이 넉넉해요.`;
   } catch (e) { $("gemMsg").textContent = "불러오지 못했어요. " + (e.message || "인터넷 연결을 확인해 주세요."); }
 };
@@ -178,14 +189,16 @@ async function gemini(body, retry = true) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(S.gemModel)}:generateContent`, {
     method: "POST",
     headers: { "x-goog-api-key": S.gemKey, "Content-Type": "application/json" },
-    body: JSON.stringify(body, (k, v) => (k === "_resolved" ? undefined : v)),
+    body: JSON.stringify(body, (k, v) => (k === "_tries" ? undefined : v)),
   });
   if (!r.ok) {
     let detail = ""; try { detail = (await r.json()).error?.message || ""; } catch {}
     // the saved model was retired or never existed for this key — pick an available one and try again
-    if (r.status === 404 && !body._resolved) {
-      await resolveGemModel();
-      return gemini({ ...body, _resolved: true }, retry);
+    // (also 429 with a zero quota: that model has no free tier for this key)
+    const tries = body._tries || 0;
+    if ((r.status === 404 || (r.status === 429 && /limit: 0|free_tier/i.test(detail))) && tries < 6) {
+      await resolveGemModel(S.gemModel);
+      return gemini({ ...body, _tries: tries + 1 }, retry);
     }
     // some models don't accept a zero thinking budget — retry once without it
     if (retry && r.status === 400 && body.generationConfig?.thinkingConfig && !/api key/i.test(detail)) {
