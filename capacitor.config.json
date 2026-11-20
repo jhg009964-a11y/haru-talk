@@ -2,5 +2,9 @@
   "appId": "com.haru.talkpractice",
   "appName": "하루",
   "webDir": "dist",
+  "server": {
+    "url": "https://jhg009964-a11y.github.io/haru-talk/",
+    "cleartext": false
+  },
   "android": { "allowMixedContent": false }
 }
