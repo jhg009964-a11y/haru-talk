@@ -1,0 +1,1 @@
+import{c as e,o as t,s as n}from"./index-s2fYesPk.js";function r(e){return new Proxy({},{get(n,r){if(typeof r!=`symbol`)throw new t(`\`${e}.${r}\` is not available in this environment; it needs a Node.js-compatible runtime`)}})}var i,a;e((()=>{n(),i=r(`fs`),a=r(`path`)}))();export{i as fs,a as path};
