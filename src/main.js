@@ -69,21 +69,31 @@ function toggleEngine() {
 $("engineSel").onchange = toggleEngine;
 function toggleProvider() { const g = $("providerSel").value === "gemini"; $("geminiBox").hidden = !g; $("claudeBox").hidden = g; }
 $("providerSel").onchange = toggleProvider;
+// Lists the text models this key can use, best pick first: stable (not preview/exp) flash, then other flash, then the rest.
+async function listGemModels(key) {
+  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": key } });
+  if (!r.ok) throw new Error(r.status === 400 || r.status === 403 ? "API 키가 맞지 않아요." : `오류 ${r.status}`);
+  const { models = [] } = await r.json();
+  const ok = models
+    .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && /gemini/.test(m.name) && !/embedding|image|tts|audio|live|vision|aqa|robotics|computer-use/.test(m.name))
+    .map((m) => m.name.replace(/^models\//, ""));
+  const rank = (n) => (/flash/.test(n) ? 0 : 4) + (/lite/.test(n) ? 1 : 0) + (/preview|exp/.test(n) ? 2 : 0);
+  return ok.sort((a, b) => rank(a) - rank(b) || b.localeCompare(a, undefined, { numeric: true }));
+}
+async function resolveGemModel() {
+  const list = await listGemModels(S.gemKey);
+  if (!list.length) throw new GeminiError(404, "no models");
+  if (!list.includes(S.gemModel)) { S.gemModel = list[0]; saveS(); }
+  return S.gemModel;
+}
 $("gemLoad").onclick = async () => {
   const key = $("gemKey").value.trim();
   if (!key) { $("gemMsg").textContent = "API 키를 먼저 넣어 주세요."; return; }
   $("gemMsg").textContent = "불러오는 중…";
   try {
-    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": key } });
-    if (!r.ok) throw new Error(r.status === 400 || r.status === 403 ? "API 키가 맞지 않아요." : `오류 ${r.status}`);
-    const { models = [] } = await r.json();
-    const ok = models
-      .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && /gemini/.test(m.name) && !/embedding|image|tts|audio|live|vision|aqa/.test(m.name))
-      .map((m) => m.name.replace(/^models\//, ""));
-    // flash first (fast + generous free tier), newest-looking names first
-    ok.sort((a, b) => (/flash/.test(b) - /flash/.test(a)) || (/lite/.test(a) - /lite/.test(b)) || b.localeCompare(a));
+    const ok = await listGemModels(key);
     const sel = $("gemModel"), keep = sel.value; sel.textContent = "";
-    ok.forEach((n) => sel.add(new Option(n + (/flash/.test(n) && !/lite/.test(n) ? " (추천)" : ""), n)));
+    ok.forEach((n, i) => sel.add(new Option(n + (i === 0 ? " (추천)" : ""), n)));
     sel.value = ok.includes(keep) ? keep : ok[0];
     $("gemMsg").textContent = `${ok.length}개 모델을 불러왔어요. 이름에 flash가 들어간 모델이 빠르고 무료 사용량이 넉넉해요.`;
   } catch (e) { $("gemMsg").textContent = "불러오지 못했어요. " + (e.message || "인터넷 연결을 확인해 주세요."); }
@@ -123,7 +133,10 @@ function readSettings() {
 }
 $("openSettings").onclick = () => { fillSettings(); show("settings"); };
 $("closeSettings").onclick = () => show("home");
-$("saveSettings").onclick = () => { readSettings(); saveS(); show("home"); };
+$("saveSettings").onclick = () => {
+  readSettings(); saveS(); show("home");
+  if (S.provider === "gemini" && S.gemKey) resolveGemModel().catch(() => {}); // make sure the saved model exists for this key
+};
 $("previewVoice").onclick = () => { readSettings(); speak("안녕! 나 하루야. 음, 이 목소리 어때? 괜찮아?"); };
 $("installVoice").onclick = () => TextToSpeech.openInstall().catch(() => alert("이 휴대폰에서는 음성 데이터 설치 화면을 열 수 없어요. 설정 → 텍스트 음성 변환에서 받아 주세요."));
 
@@ -165,10 +178,15 @@ async function gemini(body, retry = true) {
   const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(S.gemModel)}:generateContent`, {
     method: "POST",
     headers: { "x-goog-api-key": S.gemKey, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body, (k, v) => (k === "_resolved" ? undefined : v)),
   });
   if (!r.ok) {
     let detail = ""; try { detail = (await r.json()).error?.message || ""; } catch {}
+    // the saved model was retired or never existed for this key — pick an available one and try again
+    if (r.status === 404 && !body._resolved) {
+      await resolveGemModel();
+      return gemini({ ...body, _resolved: true }, retry);
+    }
     // some models don't accept a zero thinking budget — retry once without it
     if (retry && r.status === 400 && body.generationConfig?.thinkingConfig && !/api key/i.test(detail)) {
       const gc = { ...body.generationConfig }; delete gc.thinkingConfig;
