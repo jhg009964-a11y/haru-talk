@@ -21,7 +21,7 @@ const show = (id) => ["home", "call", "reportScreen", "settings"].forEach((s) =>
 
 /* ================= settings ================= */
 const S = Object.assign(
-  { apiKey: "", model: "claude-opus-5-5", voice: -1, rate: 1, pitch: 1, engine: "phone", elKey: "", elVoice: "", elVoiceName: "", elModel: "eleven_multilingual_v2" },
+  { apiKey: "", model: "claude-opus-5-5", voice: -1, rate: 1, pitch: 1, engine: "phone", elKey: "", elVoice: "", elVoiceName: "", elModel: "eleven_multilingual_v2", provider: "gemini", gemKey: "", gemModel: "gemini-2.5-flash" },
   JSON.parse(localStorage.getItem("haru.settings") || "{}")
 );
 const saveS = () => localStorage.setItem("haru.settings", JSON.stringify(S));
@@ -52,6 +52,9 @@ function fillSettings() {
   $("modelSel").value = S.model;
   $("rate").value = S.rate; $("rateVal").textContent = Number(S.rate).toFixed(2);
   $("pitch").value = S.pitch; $("pitchVal").textContent = Number(S.pitch).toFixed(2);
+  $("providerSel").value = S.provider; $("gemKey").value = S.gemKey;
+  if (![...$("gemModel").options].some((o) => o.value === S.gemModel)) $("gemModel").add(new Option(S.gemModel, S.gemModel));
+  $("gemModel").value = S.gemModel; toggleProvider();
   $("engineSel").value = S.engine; $("elKey").value = S.elKey; $("elModel").value = S.elModel;
   const sel = $("elVoice");
   if (S.elVoice && ![...sel.options].some((o) => o.value === S.elVoice)) sel.add(new Option(S.elVoiceName || S.elVoice, S.elVoice));
@@ -64,6 +67,27 @@ function toggleEngine() {
   $("elevenBox").hidden = !el; $("phoneVoiceField").hidden = el; $("installVoice").hidden = el;
 }
 $("engineSel").onchange = toggleEngine;
+function toggleProvider() { const g = $("providerSel").value === "gemini"; $("geminiBox").hidden = !g; $("claudeBox").hidden = g; }
+$("providerSel").onchange = toggleProvider;
+$("gemLoad").onclick = async () => {
+  const key = $("gemKey").value.trim();
+  if (!key) { $("gemMsg").textContent = "API 키를 먼저 넣어 주세요."; return; }
+  $("gemMsg").textContent = "불러오는 중…";
+  try {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", { headers: { "x-goog-api-key": key } });
+    if (!r.ok) throw new Error(r.status === 400 || r.status === 403 ? "API 키가 맞지 않아요." : `오류 ${r.status}`);
+    const { models = [] } = await r.json();
+    const ok = models
+      .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && /gemini/.test(m.name) && !/embedding|image|tts|audio|live|vision|aqa/.test(m.name))
+      .map((m) => m.name.replace(/^models\//, ""));
+    // flash first (fast + generous free tier), newest-looking names first
+    ok.sort((a, b) => (/flash/.test(b) - /flash/.test(a)) || (/lite/.test(a) - /lite/.test(b)) || b.localeCompare(a));
+    const sel = $("gemModel"), keep = sel.value; sel.textContent = "";
+    ok.forEach((n) => sel.add(new Option(n + (/flash/.test(n) && !/lite/.test(n) ? " (추천)" : ""), n)));
+    sel.value = ok.includes(keep) ? keep : ok[0];
+    $("gemMsg").textContent = `${ok.length}개 모델을 불러왔어요. 이름에 flash가 들어간 모델이 빠르고 무료 사용량이 넉넉해요.`;
+  } catch (e) { $("gemMsg").textContent = "불러오지 못했어요. " + (e.message || "인터넷 연결을 확인해 주세요."); }
+};
 $("elLoad").onclick = async () => {
   const key = $("elKey").value.trim();
   if (!key) { $("elMsg").textContent = "API 키를 먼저 넣어 주세요."; return; }
@@ -88,6 +112,9 @@ function readSettings() {
   S.voice = Number($("voiceSel").value);
   S.rate = Number($("rate").value);
   S.pitch = Number($("pitch").value);
+  S.provider = $("providerSel").value;
+  S.gemKey = $("gemKey").value.trim();
+  S.gemModel = $("gemModel").value || "gemini-2.5-flash";
   S.engine = $("engineSel").value;
   S.elKey = $("elKey").value.trim();
   S.elVoice = $("elVoice").value;
@@ -130,7 +157,76 @@ const client = () => new Anthropic({ apiKey: S.apiKey, dangerouslyAllowBrowser: 
 // Server-side fallback on refusals is available for Opus 5.5, not for Haiku 5.5.
 const fallbackOpts = () => (S.model === "claude-opus-5-5" ? { betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" } : {});
 
+/* ---- Gemini (REST) ---- */
+const usingGemini = () => S.provider === "gemini";
+const haveKey = () => (usingGemini() ? !!S.gemKey : !!S.apiKey);
+class GeminiError extends Error { constructor(status, detail) { super(detail || "gemini " + status); this.status = status; } }
+async function gemini(body, retry = true) {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(S.gemModel)}:generateContent`, {
+    method: "POST",
+    headers: { "x-goog-api-key": S.gemKey, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    let detail = ""; try { detail = (await r.json()).error?.message || ""; } catch {}
+    // some models don't accept a zero thinking budget — retry once without it
+    if (retry && r.status === 400 && body.generationConfig?.thinkingConfig && !/api key/i.test(detail)) {
+      const gc = { ...body.generationConfig }; delete gc.thinkingConfig;
+      return gemini({ ...body, generationConfig: gc }, false);
+    }
+    throw new GeminiError(r.status, detail);
+  }
+  const j = await r.json();
+  const c = j.candidates?.[0];
+  if (!c?.content?.parts) throw new GeminiError("blocked", j.promptFeedback?.blockReason || c?.finishReason);
+  return c.content.parts.filter((p) => !p.thought).map((p) => p.text || "").join("");
+}
+const toGem = (msgs) => msgs.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+
+/* ---- one interface for both AIs ---- */
+async function aiChat(system, messages, onText) {
+  if (usingGemini()) {
+    const t = await gemini({ systemInstruction: { parts: [{ text: system }] }, contents: toGem(messages),
+      generationConfig: { temperature: 0.9, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } } });
+    onText?.(t); return t;
+  }
+  const stream = client().beta.messages.stream({ model: S.model, max_tokens: 1024, system, messages, output_config: { effort: "low" }, ...fallbackOpts() });
+  let acc = "";
+  stream.on("text", (d) => { acc += d; onText?.(acc); });
+  const msg = await stream.finalMessage();
+  if (msg.stop_reason === "refusal") throw new Error("refusal");
+  return msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+}
+async function aiText(prompt) {
+  if (usingGemini()) return gemini({ contents: toGem([{ role: "user", content: prompt }]), generationConfig: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } } });
+  const r = await client().messages.create({ model: S.model, max_tokens: 1024, output_config: { effort: "low" }, messages: [{ role: "user", content: prompt }] });
+  return r.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+}
+async function aiJSON(prompt, schema) {
+  let text;
+  if (usingGemini()) {
+    text = await gemini({ contents: toGem([{ role: "user", content: prompt + "\n\n반드시 다음 JSON 스키마에 맞는 JSON 하나만 출력해:\n" + JSON.stringify(schema) }]),
+      generationConfig: { responseMimeType: "application/json", maxOutputTokens: 16384 } });
+  } else {
+    const r = await client().beta.messages.create({ model: S.model, max_tokens: 16000,
+      output_config: { effort: "medium", format: { type: "json_schema", schema } }, ...fallbackOpts(),
+      messages: [{ role: "user", content: prompt }] });
+    if (r.stop_reason === "refusal") throw new Error("refusal");
+    text = r.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+  }
+  return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim());
+}
+
 function errText(e) {
+  if (e instanceof GeminiError) {
+    if (e.status === 400 && /api key/i.test(e.message)) return "Gemini API 키가 맞지 않아요. 설정에서 확인해 주세요.";
+    if (e.status === 403) return "이 Gemini 키로는 쓸 수 없어요. 키 권한을 확인해 주세요.";
+    if (e.status === 404) return "고른 Gemini 모델을 찾을 수 없어요. 설정에서 모델 목록을 다시 불러와 주세요.";
+    if (e.status === 429) return "Gemini 무료 사용량을 다 썼어요. 1분쯤 쉬었다가 다시 말해 줘.";
+    if (e.status === "blocked") return "그 말은 대답하기 어려워. 다른 얘기 해 볼까?";
+    return "연결이 잠깐 끊겼어. 다시 말해 줄래?";
+  }
+  if (e instanceof TypeError) return "인터넷 연결이 불안정해요. 연결을 확인해 주세요.";
   if (e instanceof Anthropic.AuthenticationError) return "API 키가 맞지 않아요. 설정에서 키를 확인해 주세요.";
   if (e instanceof Anthropic.PermissionDeniedError) return "이 API 키로는 사용할 수 없어요. 콘솔에서 결제/권한을 확인해 주세요.";
   if (e instanceof Anthropic.RateLimitError) return "잠깐 숨 좀 돌릴게… 몇 초 뒤에 다시 말해 줘.";
@@ -173,7 +269,7 @@ function tick() {
 }
 
 $("startCall").onclick = async () => {
-  if (!S.apiKey) { fillSettings(); show("settings"); alert("먼저 Claude API 키를 넣어 주세요."); return; }
+  if (!haveKey()) { fillSettings(); show("settings"); alert(usingGemini() ? "먼저 Gemini API 키를 넣어 주세요." : "먼저 Claude API 키를 넣어 주세요."); return; }
   show("call");
   history = [{ role: "user", content: "(통화가 연결됐어. 네가 먼저 상황에 맞게 짧게 인사해.)" }];
   tips = []; heard = ""; elPrev = ""; $("mine").textContent = ""; $("caption").textContent = "";
@@ -197,19 +293,7 @@ async function haruTurn() {
   busy = true; thinking = true; setState();
   let reply = "", tip = "";
   try {
-    const stream = client().beta.messages.stream({
-      model: S.model,
-      max_tokens: 1024,
-      system: systemPrompt(),
-      messages: history,
-      output_config: { effort: "low" },
-      ...fallbackOpts(),
-    });
-    let acc = "";
-    stream.on("text", (d) => { acc += d; $("caption").textContent = acc.split("###팁")[0].trim() || "…"; });
-    const msg = await stream.finalMessage();
-    if (msg.stop_reason === "refusal") throw new Error("refusal");
-    const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+    const text = await aiChat(systemPrompt(), history, (acc) => { $("caption").textContent = acc.split("###팁")[0].trim() || "…"; });
     const i = text.indexOf("###팁");
     reply = (i < 0 ? text : text.slice(0, i)).trim();
     tip = i < 0 ? "" : text.slice(i + 4).trim().split("\n")[0].trim();
@@ -326,11 +410,8 @@ $("hintBtn").onclick = async () => {
   if (busy) return;
   $("hintBtn").disabled = true;
   try {
-    const r = await client().messages.create({
-      model: S.model, max_tokens: 1024, output_config: { effort: "low" },
-      messages: [{ role: "user", content: `대화 연습 중인 사용자가 다음에 할 말을 모르겠대. 아래 대화에 이어서 사용자가 자연스럽고 재밌게 말할 수 있는 한국어 예시 3개를 각각 한 줄로, 번호 없이 써줘. 하나는 공감 리액션, 하나는 질문, 하나는 내 이야기 꺼내기.\n상황: ${scenario.role}\n${transcript()}` }],
-    });
-    const lines = r.content.filter((b) => b.type === "text").map((b) => b.text).join("").split("\n").map((s) => s.replace(/^[-•*\d.\s]+/, "").trim()).filter(Boolean).slice(0, 3);
+    const out = await aiText(`대화 연습 중인 사용자가 다음에 할 말을 모르겠대. 아래 대화에 이어서 사용자가 자연스럽고 재밌게 말할 수 있는 한국어 예시 3개를 각각 한 줄로, 번호 없이 써줘. 하나는 공감 리액션, 하나는 질문, 하나는 내 이야기 꺼내기. 예시 문장만 써.\n상황: ${scenario.role}\n${transcript()}`);
+    const lines = out.split("\n").map((s) => s.replace(/^[-•*\d.\s]+/, "").trim()).filter(Boolean).slice(0, 3);
     flashTip("이렇게 말해 볼까? " + lines.map((l) => `“${l}”`).join("  /  "), 15000);
   } catch (e) { flashTip(errText(e)); }
   setState();
@@ -367,11 +448,7 @@ $("endBtn").onclick = async () => {
   $("report").innerHTML = '<div class="loading">내가 한 말을 하나씩 돌아보고 있어요… (10~30초)</div>';
   const tr = transcript(), duration = $("timer").textContent;
   try {
-    const r = await client().beta.messages.create({
-      model: S.model, max_tokens: 16000,
-      output_config: { effort: "medium", format: { type: "json_schema", schema: REPORT_SCHEMA } },
-      ...fallbackOpts(),
-      messages: [{ role: "user", content: `너는 다정하지만 솔직한 대화 코치야. 말주변이 없다고 느끼는 사용자가 아래 상황에서 영상통화로 대화 연습을 했어.
+    const data = await aiJSON(`너는 다정하지만 솔직한 대화 코치야. 말주변이 없다고 느끼는 사용자가 아래 상황에서 영상통화로 대화 연습을 했어.
 상황: ${scenario.title} - ${scenario.role}
 대화 시간: ${duration}
 
@@ -383,10 +460,7 @@ ${tr}
 - scores: 리액션/질문하기/내 이야기 꺼내기 각각 1~5.
 - strengths: 잘한 점 2가지, 구체적으로 발언을 인용해서.
 - mission: 다음 연습 미션 한 가지.
-- cheer: 응원 한 줄.` }],
-    });
-    if (r.stop_reason === "refusal") throw new Error("refusal");
-    const data = JSON.parse(r.content.filter((b) => b.type === "text").map((b) => b.text).join(""));
+- cheer: 응원 한 줄.`, REPORT_SCHEMA);
     renderReport(data, tr);
     const list = past();
     const d = new Date();

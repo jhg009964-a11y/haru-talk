@@ -64,16 +64,35 @@
     <h1>설정</h1>
     <button class="icon" id="closeSettings" aria-label="닫기">✕</button>
   </header>
-  <label class="field">Claude API 키
-    <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off">
-    <small>console.anthropic.com 에서 만든 키를 붙여넣으세요. 이 휴대폰 안에만 저장돼요.</small>
-  </label>
-  <label class="field">대화 모델
-    <select id="modelSel">
-      <option value="claude-opus-5-5">Claude Opus 5.5 (가장 자연스러움)</option>
-      <option value="claude-haiku-5-5">Claude Haiku 5.5 (빠르고 훨씬 저렴)</option>
+  <label class="field">대화 AI
+    <select id="providerSel">
+      <option value="gemini">Google Gemini (무료 사용량 있음)</option>
+      <option value="claude">Claude (유료 API)</option>
     </select>
   </label>
+  <div id="geminiBox" class="field">
+    <label class="field">Gemini API 키
+      <input id="gemKey" type="password" placeholder="AIza..." autocomplete="off">
+      <small>aistudio.google.com → Get API key 에서 무료로 만들 수 있어요. 이 휴대폰 안에만 저장돼요. 무료 사용량에서는 Google이 대화 내용을 서비스 개선에 쓸 수 있어요.</small>
+    </label>
+    <button class="btn" id="gemLoad" type="button">모델 목록 불러오기</button>
+    <label class="field">Gemini 모델
+      <select id="gemModel"><option value="gemini-2.5-flash">gemini-2.5-flash</option></select>
+    </label>
+    <small id="gemMsg"></small>
+  </div>
+  <div id="claudeBox" class="field" hidden>
+    <label class="field">Claude API 키
+      <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off">
+      <small>console.anthropic.com 에서 만든 키를 붙여넣으세요. 이 휴대폰 안에만 저장돼요.</small>
+    </label>
+    <label class="field">Claude 모델
+      <select id="modelSel">
+        <option value="claude-opus-5-5">Claude Opus 5.5 (가장 자연스러움)</option>
+        <option value="claude-haiku-5-5">Claude Haiku 5.5 (빠르고 훨씬 저렴)</option>
+      </select>
+    </label>
+  </div>
   <label class="field">목소리 엔진
     <select id="engineSel">
       <option value="phone">휴대폰 TTS</option>
