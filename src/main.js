@@ -21,7 +21,7 @@ const show = (id) => ["home", "call", "reportScreen", "settings"].forEach((s) =>
 
 /* ================= settings ================= */
 const S = Object.assign(
-  { apiKey: "", model: "claude-opus-5-5", voice: -1, rate: 1, pitch: 1, engine: "phone", elKey: "", elVoice: "", elVoiceName: "", elModel: "eleven_multilingual_v2", provider: "gemini", gemKey: "", gemModel: "gemini-2.5-flash" },
+  { apiKey: "", model: "claude-opus-5-5", voice: -1, rate: 1, pitch: 1, engine: "phone", elKey: "", elVoice: "", elVoiceName: "", elModel: "eleven_multilingual_v2", provider: "gemini", gemKey: "", gemModel: "" },
   JSON.parse(localStorage.getItem("haru.settings") || "{}")
 );
 const saveS = () => localStorage.setItem("haru.settings", JSON.stringify(S));
@@ -53,7 +53,7 @@ function fillSettings() {
   $("rate").value = S.rate; $("rateVal").textContent = Number(S.rate).toFixed(2);
   $("pitch").value = S.pitch; $("pitchVal").textContent = Number(S.pitch).toFixed(2);
   $("providerSel").value = S.provider; $("gemKey").value = S.gemKey;
-  if (![...$("gemModel").options].some((o) => o.value === S.gemModel)) $("gemModel").add(new Option(S.gemModel, S.gemModel));
+  if (S.gemModel && ![...$("gemModel").options].some((o) => o.value === S.gemModel)) $("gemModel").add(new Option(S.gemModel, S.gemModel));
   $("gemModel").value = S.gemModel; toggleProvider();
   $("engineSel").value = S.engine; $("elKey").value = S.elKey; $("elModel").value = S.elModel;
   const sel = $("elVoice");
@@ -69,32 +69,29 @@ function toggleEngine() {
 $("engineSel").onchange = toggleEngine;
 function toggleProvider() { const g = $("providerSel").value === "gemini"; $("geminiBox").hidden = !g; $("claudeBox").hidden = g; }
 $("providerSel").onchange = toggleProvider;
-// Lists the text models this key can use, best pick first: stable (not preview/exp) flash, then other flash, then the rest.
+// Lists the chat models this key can use, best pick for a live conversation first.
+// Measured 2026-11-21 with a new key: flash-lite models answer in ~1–2 s, full flash models took 20–100 s
+// or returned 503 (overloaded), and gemini-2.5-* answer 404 "no longer available to new users".
 async function listGemModels(key) {
   const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000", { headers: { "x-goog-api-key": key } });
   if (!r.ok) throw new Error(r.status === 400 || r.status === 403 ? "API 키가 맞지 않아요." : `오류 ${r.status}`);
   const { models = [] } = await r.json();
   const ok = models
-    .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && /gemini/.test(m.name) && !/embedding|image|tts|audio|live|vision|aqa|robotics|computer-use/.test(m.name))
+    .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && /^models\/gemini-/.test(m.name)
+      && !/embedding|image|tts|audio|live|vision|aqa|robotics|computer-use|transcribe|omni|banana|customtools/.test(m.name))
     .map((m) => m.name.replace(/^models\//, ""));
-  // Newer versions first ("-latest" aliases count as newest): older ones like 2.5 are often closed to new keys.
-  // Flash beats lite beats preview; pro and other families last (small or no free tier).
   const rank = (n) => {
-    const v = /-latest$/.test(n) ? 99 : parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0");
-    return -v * 10 + (/lite/.test(n) ? 3 : 0) + (/preview|exp/.test(n) ? 4 : 0) + (/flash/.test(n) ? 0 : 1000);
+    const v = parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || "0"); // "-latest" aliases → 0, after numbered ones
+    return (/lite/.test(n) ? 0 : 100) + (/preview|exp/.test(n) ? 50 : 0) + (/flash/.test(n) ? 0 : 1000) - v * 10;
   };
   return ok.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
 }
-// Picks the next model that hasn't failed for this key. Models listed by the API can still answer 404
-// ("no longer available to new users"), so failed ones are remembered and skipped.
-async function resolveGemModel(failed) {
-  S.gemBad = S.gemBad || [];
-  if (failed && !S.gemBad.includes(failed)) S.gemBad.push(failed);
-  const list = (await listGemModels(S.gemKey)).filter((m) => !S.gemBad.includes(m));
-  if (!list.length) { S.gemBad = []; saveS(); throw new GeminiError(404, "no models"); }
-  if (!list.includes(S.gemModel)) S.gemModel = list[0];
-  saveS();
-  return S.gemModel;
+let gemList = null; // per app session
+async function gemCandidates() {
+  if (!gemList) gemList = await listGemModels(S.gemKey);
+  const bad = S.gemBad || [];
+  const rest = gemList.filter((m) => m !== S.gemModel && !bad.includes(m));
+  return (bad.includes(S.gemModel) || !gemList.includes(S.gemModel) ? [] : [S.gemModel]).concat(rest);
 }
 $("gemLoad").onclick = async () => {
   const key = $("gemKey").value.trim();
@@ -106,7 +103,7 @@ $("gemLoad").onclick = async () => {
     const usable = ok.filter((m) => !(S.gemBad || []).includes(m));
     usable.forEach((n, i) => sel.add(new Option(n + (i === 0 ? " (추천)" : ""), n)));
     sel.value = usable.includes(keep) ? keep : usable[0];
-    $("gemMsg").textContent = `${ok.length}개 모델을 불러왔어요. 이름에 flash가 들어간 모델이 빠르고 무료 사용량이 넉넉해요.`;
+    $("gemMsg").textContent = `${usable.length}개 모델을 불러왔어요. 대화에는 flash-lite 모델이 가장 빨라요. 고른 모델이 안 되면 앱이 알아서 다른 모델로 바꿔요.`;
   } catch (e) { $("gemMsg").textContent = "불러오지 못했어요. " + (e.message || "인터넷 연결을 확인해 주세요."); }
 };
 $("elLoad").onclick = async () => {
@@ -135,7 +132,8 @@ function readSettings() {
   S.pitch = Number($("pitch").value);
   S.provider = $("providerSel").value;
   S.gemKey = $("gemKey").value.trim();
-  S.gemModel = $("gemModel").value || "gemini-2.5-flash";
+  S.gemModel = $("gemModel").value;
+  gemList = null;
   S.engine = $("engineSel").value;
   S.elKey = $("elKey").value.trim();
   S.elVoice = $("elVoice").value;
@@ -146,7 +144,6 @@ $("openSettings").onclick = () => { fillSettings(); show("settings"); };
 $("closeSettings").onclick = () => show("home");
 $("saveSettings").onclick = () => {
   readSettings(); saveS(); show("home");
-  if (S.provider === "gemini" && S.gemKey) resolveGemModel().catch(() => {}); // make sure the saved model exists for this key
 };
 $("previewVoice").onclick = () => { readSettings(); speak("안녕! 나 하루야. 음, 이 목소리 어때? 괜찮아?"); };
 $("installVoice").onclick = () => TextToSpeech.openInstall().catch(() => alert("이 휴대폰에서는 음성 데이터 설치 화면을 열 수 없어요. 설정 → 텍스트 음성 변환에서 받아 주세요."));
@@ -185,32 +182,65 @@ const fallbackOpts = () => (S.model === "claude-opus-5-5" ? { betas: ["server-si
 const usingGemini = () => S.provider === "gemini";
 const haveKey = () => (usingGemini() ? !!S.gemKey : !!S.apiKey);
 class GeminiError extends Error { constructor(status, detail) { super(detail || "gemini " + status); this.status = status; } }
-async function gemini(body, retry = true) {
-  const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(S.gemModel)}:generateContent`, {
-    method: "POST",
-    headers: { "x-goog-api-key": S.gemKey, "Content-Type": "application/json" },
-    body: JSON.stringify(body, (k, v) => (k === "_tries" ? undefined : v)),
+// One request to one model, with a time limit.
+async function geminiOnce(model, body, timeoutMs, outer) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), timeoutMs);
+  outer?.addEventListener("abort", () => ctl.abort());
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: "POST", signal: ctl.signal,
+      headers: { "x-goog-api-key": S.gemKey, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      let detail = ""; try { detail = (await r.json()).error?.message || ""; } catch {}
+      throw new GeminiError(r.status, detail);
+    }
+    const j = await r.json();
+    const c = j.candidates?.[0];
+    if (!c?.content?.parts) throw new GeminiError("blocked", j.promptFeedback?.blockReason || c?.finishReason);
+    return c.content.parts.filter((p) => !p.thought).map((p) => p.text || "").join("");
+  } catch (e) {
+    if (e.name === "AbortError") throw new GeminiError("timeout", "timeout");
+    throw e;
+  } finally { clearTimeout(timer); }
+}
+// Free-tier requests sometimes sit in a queue: the same request took 0.7 s once and 17 s the next time.
+// Sending extra requests early made it worse (it uses up the per-minute limit), so a second model is only
+// tried after `hedgeMs`; the first answer wins and the others are cancelled.
+// A model closed to this key (404, or a zero free quota) is remembered and never tried again; a busy one
+// (503, 429, 500, timeout) is only skipped this time. The model that answers becomes the saved one.
+async function gemini(body, timeoutMs = 20000, hedgeMs = 12000) {
+  const queue = (await gemCandidates()).slice(0, 5);
+  if (!queue.length) throw new GeminiError(404, "no models");
+  const stopAll = new AbortController();
+  return new Promise((resolve, reject) => {
+    let running = 0, done = false, last = null, hedgeTimer = 0;
+    const finish = (fn, v) => { if (done) return; done = true; clearTimeout(hedgeTimer); stopAll.abort(); fn(v); };
+    const launch = () => {
+      if (done) return;
+      clearTimeout(hedgeTimer);
+      const m = queue.shift();
+      if (!m) { if (!running) finish(reject, last || new GeminiError(404, "no models")); return; }
+      running++;
+      hedgeTimer = setTimeout(launch, hedgeMs);
+      geminiOnce(m, body, timeoutMs, stopAll.signal).then(
+        (t) => { if (S.gemModel !== m) { S.gemModel = m; saveS(); } finish(resolve, t); },
+        (e) => {
+          running--;
+          if (done) return;
+          if (!(e instanceof GeminiError)) return finish(reject, e); // network down
+          last = e;
+          const closed = e.status === 404 || (e.status === 429 && /limit: 0|free_tier/i.test(e.message));
+          if (closed) { S.gemBad = [...new Set([...(S.gemBad || []), m])]; saveS(); }
+          if (closed || e.status === 503 || e.status === 429 || e.status === 500 || e.status === "timeout") launch();
+          else finish(reject, e); // bad key, blocked content, malformed request: same for every model
+        },
+      );
+    };
+    launch();
   });
-  if (!r.ok) {
-    let detail = ""; try { detail = (await r.json()).error?.message || ""; } catch {}
-    // the saved model was retired or never existed for this key — pick an available one and try again
-    // (also 429 with a zero quota: that model has no free tier for this key)
-    const tries = body._tries || 0;
-    if ((r.status === 404 || (r.status === 429 && /limit: 0|free_tier/i.test(detail))) && tries < 6) {
-      await resolveGemModel(S.gemModel);
-      return gemini({ ...body, _tries: tries + 1 }, retry);
-    }
-    // some models don't accept a zero thinking budget — retry once without it
-    if (retry && r.status === 400 && body.generationConfig?.thinkingConfig && !/api key/i.test(detail)) {
-      const gc = { ...body.generationConfig }; delete gc.thinkingConfig;
-      return gemini({ ...body, generationConfig: gc }, false);
-    }
-    throw new GeminiError(r.status, detail);
-  }
-  const j = await r.json();
-  const c = j.candidates?.[0];
-  if (!c?.content?.parts) throw new GeminiError("blocked", j.promptFeedback?.blockReason || c?.finishReason);
-  return c.content.parts.filter((p) => !p.thought).map((p) => p.text || "").join("");
 }
 const toGem = (msgs) => msgs.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
 
@@ -218,7 +248,7 @@ const toGem = (msgs) => msgs.map((m) => ({ role: m.role === "assistant" ? "model
 async function aiChat(system, messages, onText) {
   if (usingGemini()) {
     const t = await gemini({ systemInstruction: { parts: [{ text: system }] }, contents: toGem(messages),
-      generationConfig: { temperature: 0.9, maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } } });
+      generationConfig: { temperature: 0.9, maxOutputTokens: 2048 } });
     onText?.(t); return t;
   }
   const stream = client().beta.messages.stream({ model: S.model, max_tokens: 1024, system, messages, output_config: { effort: "low" }, ...fallbackOpts() });
@@ -229,7 +259,7 @@ async function aiChat(system, messages, onText) {
   return msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
 }
 async function aiText(prompt) {
-  if (usingGemini()) return gemini({ contents: toGem([{ role: "user", content: prompt }]), generationConfig: { maxOutputTokens: 2048, thinkingConfig: { thinkingBudget: 0 } } });
+  if (usingGemini()) return gemini({ contents: toGem([{ role: "user", content: prompt }]), generationConfig: { maxOutputTokens: 2048 } });
   const r = await client().messages.create({ model: S.model, max_tokens: 1024, output_config: { effort: "low" }, messages: [{ role: "user", content: prompt }] });
   return r.content.filter((b) => b.type === "text").map((b) => b.text).join("");
 }
@@ -237,7 +267,7 @@ async function aiJSON(prompt, schema) {
   let text;
   if (usingGemini()) {
     text = await gemini({ contents: toGem([{ role: "user", content: prompt + "\n\n반드시 다음 JSON 스키마에 맞는 JSON 하나만 출력해:\n" + JSON.stringify(schema) }]),
-      generationConfig: { responseMimeType: "application/json", maxOutputTokens: 16384 } });
+      generationConfig: { responseMimeType: "application/json", maxOutputTokens: 16384 } }, 60000, 20000);
   } else {
     const r = await client().beta.messages.create({ model: S.model, max_tokens: 16000,
       output_config: { effort: "medium", format: { type: "json_schema", schema } }, ...fallbackOpts(),
@@ -254,6 +284,7 @@ function errText(e) {
     if (e.status === 403) return "이 Gemini 키로는 쓸 수 없어요. 키 권한을 확인해 주세요.";
     if (e.status === 404) return "고른 Gemini 모델을 찾을 수 없어요. 설정에서 모델 목록을 다시 불러와 주세요.";
     if (e.status === 429) return "Gemini 무료 사용량을 다 썼어요. 1분쯤 쉬었다가 다시 말해 줘.";
+    if (e.status === 503 || e.status === 500 || e.status === "timeout") return "지금 Gemini 서버가 바빠서 대답이 늦어. 조금 있다가 다시 말해 줘.";
     if (e.status === "blocked") return "그 말은 대답하기 어려워. 다른 얘기 해 볼까?";
     return "연결이 잠깐 끊겼어. 다시 말해 줄래?";
   }
