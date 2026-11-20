@@ -623,7 +623,7 @@ async function restartMic() {
   clearTimeout(watchdogT);
   watchdogT = setTimeout(() => { if (listening && micSession === my) restartMic(); }, mic.native ? 4000 : NO_SPEECH_MS);
   try {
-    await (mic.native ? mic.start({ language: "ko-KR", silenceMs: 1500 })
+    await (mic.native ? mic.start({ language: "ko-KR", silenceMs: 10000, continuous: true })
       : mic.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 }));
   } catch {
     setTimeout(() => { if (listening && micSession === my) restartMic(); }, 500);
@@ -679,8 +679,14 @@ function onMicEvent(e) {
   if (!listening || !mic.native) return;
   if (manual()) {
     switch (e.type) {
-      case "ready": case "begin": clearTimeout(watchdogT); showMine(); break;
-      case "partial": if (e.text) { heard = e.text; showMine(); } break;
+      // the mic is working again: forget earlier hiccups (they used to add up over a long talk and switch it off)
+      case "ready": case "begin": clearTimeout(watchdogT); errCount = 0; showMine(); break;
+      case "partial":
+        if (!e.text) break;
+        // in dictation mode some phones restart the live text after a pause: keep the earlier part
+        if (heard.length >= 4 && e.text.length < heard.length && !e.text.startsWith(heard.slice(0, 2))) kept = join(kept, heard);
+        heard = e.text; errCount = 0; showMine();
+        break;
       case "final":
         kept = join(kept, e.text || heard); heard = ""; errCount = 0;
         if (finishing) completeFinish(); else { showMine(); restartMic(); }
@@ -689,7 +695,8 @@ function onMicEvent(e) {
         if (heard) { kept = join(kept, heard); heard = ""; }
         if (finishing) { completeFinish(); break; }
         if (e.code === 9) { stopMic(); $("mine").textContent = "마이크 권한이 필요해요. 휴대폰 설정 → 앱 → 하루 → 권한에서 마이크를 허용해 주세요."; break; }
-        if (e.code !== 6 && e.code !== 7 && errCount++ > 8) { stopMic(); $("mine").textContent = "마이크가 잘 안 켜져요. 🎤 버튼을 다시 눌러 주세요."; break; }
+        // 9 failures in a row without the mic ever working
+        if (e.code !== 6 && e.code !== 7 && ++errCount > 8) { stopMic(); $("mine").textContent = "마이크가 잘 안 켜져요. 🎤 버튼을 다시 눌러 주세요."; break; }
         showMine(); restartMic(); // a pause or a hiccup: keep listening
         break;
     }
@@ -770,7 +777,7 @@ async function listen(fromTap = false) {
     try {
       // (the legacy plugin's stop() never answers, so never await it)
       await (mic.native
-        ? mic.start({ language: "ko-KR", silenceMs: 900 })
+        ? mic.start(manual() ? { language: "ko-KR", silenceMs: 10000, continuous: true } : { language: "ko-KR", silenceMs: 900 })
         : mic.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 }));
       return;
     } catch (e) {

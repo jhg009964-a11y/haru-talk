@@ -54,6 +54,8 @@ public class HaruMicPlugin extends Plugin {
     private void begin(PluginCall call) {
         final String language = call.getString("language", "ko-KR");
         final int silenceMs = call.getInt("silenceMs", 900);
+        // tap-to-talk: dictation mode keeps listening through pauses until stop() is called
+        final boolean continuous = Boolean.TRUE.equals(call.getBoolean("continuous", false));
         main.post(() -> {
             try {
                 if (recognizer == null) {
@@ -76,6 +78,10 @@ public class HaruMicPlugin extends Plugin {
                 intent.putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, getContext().getPackageName());
                 intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, silenceMs);
                 intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, silenceMs);
+                if (continuous) {
+                    intent.putExtra("android.speech.extra.DICTATION_MODE", true);
+                    intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 60000);
+                }
 
                 startedAt = SystemClock.elapsedRealtime();
                 recognizer.startListening(intent);
