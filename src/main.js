@@ -1,6 +1,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { SpeechRecognition } from "@capacitor-community/speech-recognition";
 import { TextToSpeech } from "@capacitor-community/text-to-speech";
+import { Capacitor, registerPlugin } from "@capacitor/core";
+// Haru's own mic module (android/app/.../HaruMicPlugin.java). Older installs don't have it and use the community plugin.
+const HaruMic = registerPlugin("HaruMic");
 
 /* ================= data ================= */
 const SCENARIOS = [
@@ -398,7 +401,8 @@ $("startCall").onclick = async () => {
   if (!haveKey()) { fillSettings(); show("settings"); alert(usingGemini() ? "먼저 Gemini API 키를 넣어 주세요." : "먼저 Claude API 키를 넣어 주세요."); return; }
   show("call");
   history = [{ role: "user", content: "(통화가 연결됐어. 네가 먼저 상황에 맞게 짧게 인사해.)" }];
-  tips = []; heard = ""; elPrev = ""; reopenCount = 0; elWarned = false; $("mine").textContent = ""; $("caption").textContent = "";
+  tips = []; heard = ""; elPrev = ""; reopenCount = 0; elWarned = false; errCount = 0;
+  if (useEleven()) voiceSettings(); // fetch the voice's settings now, not when the first sentence is waiting $("mine").textContent = ""; $("caption").textContent = "";
   inCall = true; startTime = Date.now(); clearInterval(timerId); timerId = setInterval(tick, 1000); tick();
   setState();
   startCamera();
@@ -477,14 +481,15 @@ async function voiceSettings() {
 }
 // Spoken-text cleanup: ElevenLabs reads "…" and "~" oddly in Korean.
 const tidy = (t) => t.replace(/…+|\.{3,}/g, ", ").replace(/~+/g, "").replace(/\s+,/g, ",").replace(/,\s*,/g, ",").trim();
-// Fetches the audio for one piece of text (called as soon as the sentence exists, so the next
-// sentence downloads while the current one plays).
+// Starts generating the audio for one piece of text (called as soon as the sentence exists, so the next
+// sentence is already being made while the current one plays). Uses the streaming endpoint: the audio
+// arrives in pieces and playback starts with the first piece instead of after the whole sentence.
 async function elevenFetch(text) {
   const body = { text: tidy(text), model_id: S.elModel };
-  const vs = await voiceSettings(); if (vs) body.voice_settings = vs;
   if (S.elModel !== "eleven_v3" && elPrev) body.previous_text = elPrev; // keeps intonation consistent between sentences
   elPrev = body.text;
-  const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(S.elVoice)}?output_format=mp3_44100_128`, {
+  const vs = await voiceSettings(); if (vs) body.voice_settings = vs;
+  const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(S.elVoice)}/stream?output_format=mp3_44100_128`, {
     method: "POST",
     headers: { "xi-api-key": S.elKey, "Content-Type": "application/json", Accept: "audio/mpeg" },
     body: JSON.stringify(body),
@@ -493,7 +498,33 @@ async function elevenFetch(text) {
     const msg = r.status === 401 ? "ElevenLabs 키가 맞지 않아요" : r.status === 402 || r.status === 429 ? "ElevenLabs 크레딧/사용량이 부족해요" : `ElevenLabs 오류 ${r.status}`;
     throw new Error(msg);
   }
-  return r.blob();
+  return r;
+}
+// Plays a streaming MP3 response, starting as soon as the first piece has arrived (MediaSource);
+// falls back to waiting for the whole file where MediaSource can't play MP3.
+async function playResponse(res) {
+  const canStream = res.body && window.MediaSource && MediaSource.isTypeSupported("audio/mpeg");
+  if (!canStream) return playBlob(await res.blob());
+  const ms = new MediaSource(), url = URL.createObjectURL(ms);
+  const a = new Audio(url); elAudio = a;
+  try {
+    const ended = new Promise((ok, fail) => { a.onended = ok; a.onerror = () => fail(new Error("재생 실패")); });
+    ended.catch(() => {});
+    await new Promise((r) => ms.addEventListener("sourceopen", r, { once: true }));
+    const sb = ms.addSourceBuffer("audio/mpeg");
+    const reader = res.body.getReader();
+    let started = false;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done || elAudio !== a) { if (elAudio !== a) reader.cancel().catch(() => {}); break; }
+      sb.appendBuffer(value);
+      await new Promise((r) => sb.addEventListener("updateend", r, { once: true }));
+      if (!started) { started = true; a.play().catch(() => {}); }
+    }
+    if (ms.readyState === "open") ms.endOfStream();
+    if (!started) a.play().catch(() => {}); // very short clip that arrived in one piece
+    await ended;
+  } finally { URL.revokeObjectURL(url); if (elAudio === a) elAudio = null; }
 }
 async function playBlob(blob) {
   const url = URL.createObjectURL(blob);
@@ -513,7 +544,10 @@ async function phoneSay(text) {
     await new Promise((r) => setTimeout(r, Math.min(8000, text.length * 110)));
   }
 }
-function stopSpeaking() { TextToSpeech.stop().catch(() => {}); if (elAudio) { elAudio.pause(); elAudio.onended?.(); } }
+function stopSpeaking() {
+  TextToSpeech.stop().catch(() => {});
+  if (elAudio) { const a = elAudio; elAudio = null; a.pause(); a.onended?.(); }
+}
 
 /* A queue of things for Haru to say, played in order. sayReset() cuts it off (new turn, user interrupts). */
 const useEleven = () => S.engine === "eleven" && S.elKey && S.elVoice;
@@ -531,7 +565,7 @@ async function sayLoop(gen) {
     const it = sayQ.shift();
     if (it.audio) {
       try {
-        await playBlob(await it.audio);
+        await playResponse(await it.audio);
         if (!$("settings").hidden) $("elMsg").textContent = "✓ ElevenLabs 목소리로 재생했어요.";
         continue;
       } catch (e) {
@@ -559,8 +593,9 @@ async function speak(text) { sayReset(); elWarned = false; sayPush(text); await 
 // So the page keeps its own state: it decides the turn is over after a short silence in the live text,
 // and reopens the mic if nothing at all has arrived for a while.
 const mic = {
-  start: (o) => SpeechRecognition.start(o),
-  stop: () => SpeechRecognition.stop(),
+  native: Capacitor.isPluginAvailable("HaruMic"), // new installs: Haru's own module, which reports every stage
+  start: (o) => (mic.native ? HaruMic.start(o) : SpeechRecognition.start(o)),
+  stop: () => (mic.native ? HaruMic.cancel() : SpeechRecognition.stop()),
 };
 const SILENCE_MS = 1300;  // no new words for this long → the person has finished
 const NO_SPEECH_MS = 8000; // nothing heard at all → the recognizer has probably shut down; reopen it
@@ -585,8 +620,49 @@ function onListeningState(d) {
     clearTimeout(silenceT); silenceT = setTimeout(endTurn, heard.trim() ? 500 : 300);
   }
 }
-SpeechRecognition.addListener("partialResults", (d) => onPartial(d));
-SpeechRecognition.addListener("listeningState", (d) => onListeningState(d));
+SpeechRecognition.addListener("partialResults", (d) => { if (!mic.native) onPartial(d); });
+SpeechRecognition.addListener("listeningState", (d) => { if (!mic.native) onListeningState(d); });
+
+// Haru's own module tells us exactly what happens, so no guessing is needed:
+// ready → the mic can hear now; partial → live words; final → the turn is over; error → reopen right away.
+let errCount = 0;
+function onMicEvent(e) {
+  if (!listening || !mic.native) return;
+  switch (e.type) {
+    case "ready":
+      clearTimeout(watchdogT);
+      $("mine").textContent = "🎤 지금 말하세요";
+      // Android ends a silent turn itself (error 6/7) after ~5–8 s; this is only a safety net
+      watchdogT = setTimeout(() => { if (listening && !heard) { stopMic(); reopen(); } }, 12000);
+      break;
+    case "begin":
+      clearTimeout(watchdogT); speechEnded = false;
+      break;
+    case "partial":
+      if (!e.text || e.text === heard) break;
+      heard = e.text; $("mine").textContent = heard;
+      clearTimeout(silenceT); silenceT = setTimeout(endTurn, speechEnded ? 400 : 2000); // backup if "final" is late
+      break;
+    case "end":
+      speechEnded = true;
+      clearTimeout(silenceT); silenceT = setTimeout(endTurn, 800);
+      break;
+    case "final":
+      if (e.text) heard = e.text;
+      errCount = 0;
+      endTurn();
+      break;
+    case "error":
+      if (heard.trim()) { endTurn(); break; }
+      stopMic();
+      if (e.code === 9) { $("mine").textContent = "마이크 권한이 필요해요. 휴대폰 설정 → 앱 → 하루 → 권한에서 마이크를 허용해 주세요."; break; }
+      if (e.code === 6 || e.code === 7) reopen(); // nobody spoke / nothing recognisable: counts toward the quiet limit
+      else if (errCount++ < 5) listenSoon(300); // recognizer hiccup: reopen at once
+      else $("mine").textContent = "마이크가 잘 안 켜져요. 🎤 버튼을 눌러 주세요.";
+      break;
+  }
+}
+if (mic.native) HaruMic.addListener("mic", onMicEvent);
 
 function stopMic() {
   if (!listening) return;
@@ -607,24 +683,30 @@ function reopen() {
   if (reopenCount++ < MAX_REOPEN) listenSoon(250);
   else $("mine").textContent = "🎤 버튼을 누르고 말해 주세요";
 }
-function listenSoon(ms = 250) { clearTimeout(listenSoonT); listenSoonT = setTimeout(() => listen(), ms); }
+function listenSoon(ms = 120) { clearTimeout(listenSoonT); listenSoonT = setTimeout(() => listen(), ms); }
 
 async function listen(fromTap = false) {
   if (!inCall || listening || busy) return;
   if (fromTap) reopenCount = 0;
   sayReset(); // never listen while Haru is talking (the mic would hear her)
+  if (fromTap) errCount = 0;
   listening = true; heard = ""; speechEnded = false; const my = ++micSession;
-  $("mine").textContent = "듣고 있어요… 말해 보세요";
+  $("mine").textContent = mic.native ? "마이크 켜는 중…" : "듣고 있어요… 말해 보세요";
   setState();
   clearTimeout(watchdogT);
-  watchdogT = setTimeout(() => { if (listening && micSession === my && !heard) { stopMic(); reopen(); } }, NO_SPEECH_MS);
+  // legacy plugin: no error reports, so reopen after a quiet spell; new module: reopen if it never says "ready"
+  watchdogT = setTimeout(() => { if (listening && micSession === my && !heard) { stopMic(); reopen(); } }, mic.native ? 4000 : NO_SPEECH_MS);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      await mic.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 });
+      // (the legacy plugin's stop() never answers, so never await it)
+      await (mic.native
+        ? mic.start({ language: "ko-KR", silenceMs: 900 })
+        : mic.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 }));
       return;
     } catch (e) {
       if (micSession !== my) return; // stopped meanwhile
-      if (attempt === 0) { await mic.stop().catch(() => {}); await new Promise((r) => setTimeout(r, 600)); continue; } // recognizer still busy from last time
+      if (/permission/i.test(String(e?.message || e))) { listening = false; clearTimeout(watchdogT); setState(); $("mine").textContent = "마이크 권한을 허용해 주세요."; return; }
+      if (attempt === 0) { mic.stop().catch(() => {}); await new Promise((r) => setTimeout(r, 400)); continue; } // recognizer still busy from last time
       listening = false; clearTimeout(watchdogT); setState();
       $("mine").textContent = "마이크를 쓸 수 없어요. 아래에 글로 입력해 주세요.";
     }
@@ -639,7 +721,7 @@ $("typeForm").onsubmit = (e) => {
   userSays(t);
 };
 function userSays(t) { clearTimeout(listenSoonT); $("mine").textContent = t; history.push({ role: "user", content: t }); haruTurn(); }
-if (import.meta.env.DEV) window.__haru = { mic, voiceOut, onPartial, onListeningState, state: () => ({ listening, speaking, busy, thinking, heard, reopenCount }) };
+if (import.meta.env.DEV) window.__haru = { mic, voiceOut, onPartial, onListeningState, onMicEvent, state: () => ({ listening, speaking, busy, thinking, heard, reopenCount }) };
 
 $("hintBtn").onclick = async () => {
   if (busy) return;
