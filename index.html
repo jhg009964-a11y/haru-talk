@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>하루</title>
+<link rel="stylesheet" href="./src/style.css">
+</head>
+<body>
+<!-- ===== Home ===== -->
+<section id="home" class="screen">
+  <header class="top">
+    <h1>하루</h1>
+    <button class="icon" id="openSettings" aria-label="설정">⚙</button>
+  </header>
+  <p class="lead">오늘은 어떤 상황에서 대화해 볼까요?</p>
+  <div class="scen" id="scenList"></div>
+  <label class="field">하루의 성격
+    <select id="personaSel">
+      <option value="warm">다정하고 리액션이 큰 편 (처음이라면 추천)</option>
+      <option value="normal">보통 사람처럼 자연스럽게</option>
+      <option value="shy">말수가 적어서 내가 이끌어야 함 (어려움)</option>
+    </select>
+  </label>
+  <button class="big call" id="startCall">📞 영상통화 시작</button>
+  <h2 class="sub">지난 연습 기록</h2>
+  <div id="pastList" class="past"></div>
+</section>
+
+<!-- ===== Call ===== -->
+<section id="call" class="screen" hidden>
+  <div class="stage">
+    <canvas id="face" width="600" height="600"></canvas>
+    <div class="callTop"><b>하루</b> · <span id="haruState">연결 중</span> · <span id="timer">00:00</span></div>
+    <video id="selfCam" autoplay playsinline muted></video>
+    <div class="caption" id="caption"></div>
+    <div class="mine" id="mine"></div>
+    <div class="tipToast" id="tipToast" hidden></div>
+  </div>
+  <div class="controls">
+    <button class="round" id="camBtn" aria-label="카메라 켜기/끄기">📷</button>
+    <button class="round mic" id="micBtn" aria-label="말하기">🎤</button>
+    <button class="round" id="hintBtn" aria-label="뭐라고 하지?">💡</button>
+    <button class="round end" id="endBtn" aria-label="통화 종료">✕</button>
+  </div>
+  <form class="typeRow" id="typeForm">
+    <input id="typeInput" placeholder="글로 말하기" autocomplete="off">
+    <button>보내기</button>
+  </form>
+</section>
+
+<!-- ===== Report ===== -->
+<section id="reportScreen" class="screen" hidden>
+  <header class="top">
+    <h1>대화 돌아보기</h1>
+    <button class="icon" id="closeReport" aria-label="닫기">✕</button>
+  </header>
+  <div id="report" class="report"></div>
+</section>
+
+<!-- ===== Settings ===== -->
+<section id="settings" class="screen" hidden>
+  <header class="top">
+    <h1>설정</h1>
+    <button class="icon" id="closeSettings" aria-label="닫기">✕</button>
+  </header>
+  <label class="field">Claude API 키
+    <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off">
+    <small>console.anthropic.com 에서 만든 키를 붙여넣으세요. 이 휴대폰 안에만 저장돼요.</small>
+  </label>
+  <label class="field">대화 모델
+    <select id="modelSel">
+      <option value="claude-opus-5-5">Claude Opus 5.5 (가장 자연스러움)</option>
+      <option value="claude-haiku-5-5">Claude Haiku 5.5 (빠르고 훨씬 저렴)</option>
+    </select>
+  </label>
+  <label class="field">목소리 엔진
+    <select id="engineSel">
+      <option value="phone">휴대폰 TTS</option>
+      <option value="eleven">ElevenLabs</option>
+    </select>
+  </label>
+  <div id="elevenBox" class="field" hidden>
+    <label class="field">ElevenLabs API 키
+      <input id="elKey" type="password" placeholder="sk_..." autocomplete="off">
+      <small>elevenlabs.io → 프로필 → API Keys 에서 만든 키. 이 휴대폰 안에만 저장돼요.</small>
+    </label>
+    <button class="btn" id="elLoad" type="button">내 목소리 불러오기</button>
+    <label class="field">ElevenLabs 목소리
+      <select id="elVoice"><option value="">먼저 목소리를 불러와 주세요</option></select>
+    </label>
+    <label class="field">품질
+      <select id="elModel">
+        <option value="eleven_multilingual_v2">자연스럽게 · Multilingual v2 (추천)</option>
+        <option value="eleven_v3">감정 표현 최고 · v3 (조금 느림)</option>
+        <option value="eleven_flash_v2_5">빠르게 · Flash (품질 낮음, 크레딧 절반)</option>
+      </select>
+    </label>
+    <small id="elMsg"></small>
+  </div>
+  <label class="field" id="phoneVoiceField">하루 목소리
+    <select id="voiceSel"></select>
+    <small>휴대폰에 설치된 TTS 엔진의 한국어 목소리예요. 다른 TTS 앱을 깔았다면 휴대폰 설정 → 텍스트 음성 변환에서 기본 엔진을 바꾼 뒤 앱을 다시 열어 주세요.</small>
+  </label>
+  <div class="rowBtns">
+    <button class="btn" id="previewVoice">목소리 들어보기</button>
+    <button class="btn" id="installVoice">음성 데이터 받기</button>
+  </div>
+  <label class="field">말하는 속도 <span id="rateVal">1.0</span>
+    <input id="rate" type="range" min="0.7" max="1.4" step="0.05" value="1">
+  </label>
+  <label class="field">목소리 높이 <span id="pitchVal">1.0</span>
+    <input id="pitch" type="range" min="0.7" max="1.4" step="0.05" value="1">
+  </label>
+  <button class="big" id="saveSettings">저장</button>
+</section>
+
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>

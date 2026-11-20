@@ -1,0 +1,6 @@
+{
+  "appId": "com.haru.talkpractice",
+  "appName": "하루",
+  "webDir": "dist",
+  "android": { "allowMixedContent": false }
+}
