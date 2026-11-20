@@ -55,6 +55,7 @@ function fillSettings() {
   $("modelSel").value = S.model;
   $("rate").value = S.rate; $("rateVal").textContent = Number(S.rate).toFixed(2);
   $("pitch").value = S.pitch; $("pitchVal").textContent = Number(S.pitch).toFixed(2);
+  $("autoMic").checked = S.autoMic === true;
   $("providerSel").value = S.provider; $("gemKey").value = S.gemKey;
   if (S.gemModel && ![...$("gemModel").options].some((o) => o.value === S.gemModel)) $("gemModel").add(new Option(S.gemModel, S.gemModel));
   $("gemModel").value = S.gemModel; toggleProvider();
@@ -133,6 +134,7 @@ function readSettings() {
   S.voice = Number($("voiceSel").value);
   S.rate = Number($("rate").value);
   S.pitch = Number($("pitch").value);
+  S.autoMic = $("autoMic").checked;
   S.provider = $("providerSel").value;
   S.gemKey = $("gemKey").value.trim();
   S.gemModel = $("gemModel").value;
@@ -447,7 +449,7 @@ async function haruTurn() {
     sayReset();
     $("caption").textContent = errText(e);
     if (history.at(-1)?.role === "user" && history.length > 1) history.pop();
-    listenSoon();
+    afterHaru();
     return;
   }
   thinking = false;
@@ -456,7 +458,13 @@ async function haruTurn() {
   $("caption").textContent = reply;
   busy = false; setState();
   await sayDone();
-  listenSoon(); // hands-free: listen as soon as Haru stops talking
+  afterHaru();
+}
+// After Haru has spoken: open the mic by itself (auto mode) or wait for the tap (tap-to-talk).
+function afterHaru() {
+  if (!inCall || busy || listening) return;
+  if (manual()) $("mine").textContent = "🎤 버튼을 누르고 말하세요";
+  else listenSoon();
 }
 
 let tipTimer = 0;
@@ -602,10 +610,46 @@ const NO_SPEECH_MS = 8000; // nothing heard at all → the recognizer has probab
 const MAX_REOPEN = 6;      // quiet reopenings (~50 s of silence) before waiting for a tap
 let micSession = 0, silenceT = 0, watchdogT = 0, reopenCount = 0, listenSoonT = 0;
 
+/* Tap-to-talk (the default): the person taps 🎤 to start and taps again when finished. The phone's recognizer
+   still stops by itself at every pause, so in this mode each piece it hears is kept and the recognizer is
+   restarted at once, until the second tap sends everything. */
+const manual = () => S.autoMic !== true;
+let kept = "", finishing = false, finishT = 0;
+const join = (a, b) => [a, b].map((x) => (x || "").trim()).filter(Boolean).join(" ");
+function showMine() { $("mine").textContent = join(kept, heard) || "🎤 듣는 중… 다 말하면 🎤를 다시 누르세요"; }
+async function restartMic() {
+  if (!listening || finishing) return;
+  const my = ++micSession;
+  clearTimeout(watchdogT);
+  watchdogT = setTimeout(() => { if (listening && micSession === my) restartMic(); }, mic.native ? 4000 : NO_SPEECH_MS);
+  try {
+    await (mic.native ? mic.start({ language: "ko-KR", silenceMs: 1500 })
+      : mic.start({ language: "ko-KR", partialResults: true, popup: false, maxResults: 1 }));
+  } catch {
+    setTimeout(() => { if (listening && micSession === my) restartMic(); }, 500);
+  }
+}
+function finishManual() {
+  if (finishing || !listening) return;
+  finishing = true;
+  $("micBtn").disabled = true;
+  if (mic.native) HaruMic.stop().catch(() => {}); // ask for the last words as a "final" event
+  finishT = setTimeout(completeFinish, mic.native ? 700 : 400);
+}
+function completeFinish() {
+  if (!finishing) return;
+  clearTimeout(finishT);
+  const t = join(kept, heard); kept = ""; heard = "";
+  stopMic();
+  if (t && inCall && !busy) userSays(t);
+  else $("mine").textContent = "🎤 버튼을 누르고 말하세요";
+}
+
 function onPartial(d) {
   if (!listening) return;
   const t = d.matches?.[0];
   if (!t || t === heard) return;
+  if (manual()) { heard = t; showMine(); clearTimeout(watchdogT); return; }
   heard = t; $("mine").textContent = heard;
   clearTimeout(watchdogT);
   clearTimeout(silenceT); silenceT = setTimeout(endTurn, speechEnded ? 300 : SILENCE_MS);
@@ -613,6 +657,11 @@ function onPartial(d) {
 let speechEnded = false;
 function onListeningState(d) {
   if (!listening) return;
+  if (manual()) {
+    // the recognizer paused by itself: keep what it heard (final words may still arrive) and carry on listening
+    if (d.status === "stopped") setTimeout(() => { if (!listening || finishing) return; kept = join(kept, heard); heard = ""; showMine(); restartMic(); }, 400);
+    return;
+  }
   if (d.status === "started") speechEnded = false;
   if (d.status === "stopped") {
     speechEnded = true;
@@ -628,6 +677,24 @@ SpeechRecognition.addListener("listeningState", (d) => { if (!mic.native) onList
 let errCount = 0;
 function onMicEvent(e) {
   if (!listening || !mic.native) return;
+  if (manual()) {
+    switch (e.type) {
+      case "ready": case "begin": clearTimeout(watchdogT); showMine(); break;
+      case "partial": if (e.text) { heard = e.text; showMine(); } break;
+      case "final":
+        kept = join(kept, e.text || heard); heard = ""; errCount = 0;
+        if (finishing) completeFinish(); else { showMine(); restartMic(); }
+        break;
+      case "error":
+        if (heard) { kept = join(kept, heard); heard = ""; }
+        if (finishing) { completeFinish(); break; }
+        if (e.code === 9) { stopMic(); $("mine").textContent = "마이크 권한이 필요해요. 휴대폰 설정 → 앱 → 하루 → 권한에서 마이크를 허용해 주세요."; break; }
+        if (e.code !== 6 && e.code !== 7 && errCount++ > 8) { stopMic(); $("mine").textContent = "마이크가 잘 안 켜져요. 🎤 버튼을 다시 눌러 주세요."; break; }
+        showMine(); restartMic(); // a pause or a hiccup: keep listening
+        break;
+    }
+    return;
+  }
   switch (e.type) {
     case "ready":
       clearTimeout(watchdogT);
@@ -666,8 +733,8 @@ if (mic.native) HaruMic.addListener("mic", onMicEvent);
 
 function stopMic() {
   if (!listening) return;
-  listening = false; micSession++;
-  clearTimeout(silenceT); clearTimeout(watchdogT);
+  listening = false; micSession++; finishing = false;
+  clearTimeout(silenceT); clearTimeout(watchdogT); clearTimeout(finishT);
   mic.stop().catch(() => {});
   setState();
 }
@@ -690,12 +757,15 @@ async function listen(fromTap = false) {
   if (fromTap) reopenCount = 0;
   sayReset(); // never listen while Haru is talking (the mic would hear her)
   if (fromTap) errCount = 0;
-  listening = true; heard = ""; speechEnded = false; const my = ++micSession;
-  $("mine").textContent = mic.native ? "마이크 켜는 중…" : "듣고 있어요… 말해 보세요";
+  listening = true; heard = ""; kept = ""; finishing = false; speechEnded = false; const my = ++micSession;
+  $("mine").textContent = mic.native ? "마이크 켜는 중…" : manual() ? "🎤 듣는 중… 다 말하면 🎤를 다시 누르세요" : "듣고 있어요… 말해 보세요";
   setState();
   clearTimeout(watchdogT);
   // legacy plugin: no error reports, so reopen after a quiet spell; new module: reopen if it never says "ready"
-  watchdogT = setTimeout(() => { if (listening && micSession === my && !heard) { stopMic(); reopen(); } }, mic.native ? 4000 : NO_SPEECH_MS);
+  watchdogT = setTimeout(() => {
+    if (!listening || micSession !== my || heard) return;
+    if (manual()) restartMic(); else { stopMic(); reopen(); }
+  }, mic.native ? 4000 : NO_SPEECH_MS);
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       // (the legacy plugin's stop() never answers, so never await it)
@@ -712,11 +782,14 @@ async function listen(fromTap = false) {
     }
   }
 }
-$("micBtn").onclick = () => { if (listening) endTurn(); else listen(true); };
+$("micBtn").onclick = () => {
+  if (listening) { if (manual()) finishManual(); else endTurn(); }
+  else listen(true);
+};
 $("typeForm").onsubmit = (e) => {
   e.preventDefault();
   const t = $("typeInput").value.trim(); if (!t || busy || !inCall) return;
-  $("typeInput").value = ""; heard = "";
+  $("typeInput").value = ""; heard = ""; kept = "";
   stopMic();
   userSays(t);
 };
